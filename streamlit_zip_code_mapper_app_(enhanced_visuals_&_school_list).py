@@ -3,9 +3,7 @@ import pandas as pd
 import folium
 import zipcodes as zc
 from streamlit_folium import st_folium
-from folium.plugins import HeatMap
 import re
-import math
 from pathlib import Path
 
 st.set_page_config(layout="wide")
@@ -15,11 +13,12 @@ BASE_DIR = Path(__file__).resolve().parent
 _ZIP_COORDS_PATH = BASE_DIR / "zip_coords.csv"
 
 ###############################################################################
-# COORDINATE RESOLUTION
+# HELPER FUNCTIONS
 ###############################################################################
 
 @st.cache_data
 def _load_zip_coords_csv() -> dict:
+    """Loads Census ZCTA representative-point CSV → zip: (lat, lon) dict."""
     if not _ZIP_COORDS_PATH.is_file():
         return {}
     df = pd.read_csv(_ZIP_COORDS_PATH, dtype={"zip": str})
@@ -29,8 +28,9 @@ def _load_zip_coords_csv() -> dict:
 
 @st.cache_data
 def get_zip_coords(zip_code: str) -> dict | None:
-    """
-    Coordinate priority:
+    """Returns {lat, lon, city, state, county} for a ZIP code, or None.
+
+    Coordinate source priority:
       1. Census ZCTA 2020 representative_point() — guaranteed on land
       2. zipcodes package centroid — fallback for non-ZCTA ZIPs
     """
@@ -44,16 +44,13 @@ def get_zip_coords(zip_code: str) -> dict | None:
         lat = float(results[0]['lat'])
         lon = float(results[0]['long'])
 
+    # Enrich with city/state/county metadata from zipcodes package
     meta = zc.matching(zip_code)
     city   = meta[0].get('city', '')   if meta else ''
     state  = meta[0].get('state', '')  if meta else ''
     county = meta[0].get('county', '') if meta else ''
     return {'lat': lat, 'lon': lon, 'city': city, 'state': state, 'county': county}
 
-
-###############################################################################
-# INPUT PROCESSING
-###############################################################################
 
 def process_input_dataframe(df_input: pd.DataFrame) -> pd.DataFrame:
     if df_input is None or df_input.empty:
@@ -80,6 +77,37 @@ def process_input_dataframe(df_input: pd.DataFrame) -> pd.DataFrame:
     return df[['zip', 'teachers', 'tas']].drop_duplicates(subset=['zip'], keep='first')
 
 
+def load_and_process_csv_data(uploaded_file_object) -> pd.DataFrame:
+    if uploaded_file_object is None:
+        return pd.DataFrame(columns=['zip', 'teachers', 'tas'])
+    try:
+        uploaded_file_object.seek(0)
+        try:
+            first_lines_bytes = uploaded_file_object.read(2048)
+            first_lines_str = first_lines_bytes.decode('utf-8-sig').splitlines()[0]
+        except UnicodeDecodeError:
+            uploaded_file_object.seek(0)
+            first_lines_bytes = uploaded_file_object.read(2048)
+            first_lines_str = first_lines_bytes.decode('latin1', errors='ignore').splitlines()[0]
+        except IndexError:
+            st.warning("Uploaded CSV file appears to be empty.")
+            return pd.DataFrame(columns=['zip', 'teachers', 'tas'])
+
+        delimiter = ';' if ';' in first_lines_str and first_lines_str.count(';') >= first_lines_str.count(',') else ','
+        uploaded_file_object.seek(0)
+        df_csv = pd.read_csv(uploaded_file_object, delimiter=delimiter, encoding='utf-8-sig', encoding_errors='ignore')
+
+        temp_cols = [col.strip().lower() for col in df_csv.columns]
+        if 'zip' not in temp_cols and 'zip code' not in temp_cols:
+            st.error("Uploaded CSV must contain a 'zip' or 'zip code' column.")
+            return pd.DataFrame(columns=['zip', 'teachers', 'tas'])
+
+        return process_input_dataframe(df_csv)
+    except Exception as e:
+        st.error(f"Error loading or processing uploaded CSV: {e}")
+        return pd.DataFrame(columns=['zip', 'teachers', 'tas'])
+
+
 def parse_zips_from_text(text: str) -> pd.DataFrame:
     tokens = re.split(r'[\s,;]+', text.strip())
     zips = [t.zfill(5) for t in tokens if re.fullmatch(r'\d{3,5}', t.strip())]
@@ -88,100 +116,19 @@ def parse_zips_from_text(text: str) -> pd.DataFrame:
 
 
 ###############################################################################
-# SPREAD ANALYSIS
+# FOLIUM MAP FUNCTION
 ###############################################################################
 
-def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 3958.8
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) ** 2
-         + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
-         * math.sin(dlon / 2) ** 2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-def analyse_spread(rows: list) -> list:
-    """
-    Classifies every pair of ZIPs by center-to-center distance:
-      < 10 mi  → too_close   (5-mile rings overlap)
-      10–20 mi → overlap_ok  (10-mile rings overlap, 5-mile don't)
-      20–25 mi → ideal       (< 5-mile gap between 10-mile rings)
-      > 25 mi  → too_sparse  (> 5-mile gap)
-    """
-    pairs = []
-    for i in range(len(rows)):
-        for j in range(i + 1, len(rows)):
-            d = haversine_miles(rows[i]['lat'], rows[i]['lon'],
-                                rows[j]['lat'], rows[j]['lon'])
-            if d < 10:
-                status = 'too_close'
-            elif d < 20:
-                status = 'overlap_ok'
-            elif d <= 25:
-                status = 'ideal'
-            else:
-                status = 'too_sparse'
-            pairs.append({
-                'i': i, 'j': j,
-                'zip_i': rows[i]['zip'], 'zip_j': rows[j]['zip'],
-                'miles': round(d, 1), 'status': status,
-            })
-    return pairs
-
-
-def worst_status_per_zip(rows: list, pairs: list) -> list:
-    """Returns the worst pairwise status for each ZIP index."""
-    order = ['too_close', 'overlap_ok', 'ideal', 'too_sparse']
-    worst = ['ideal'] * len(rows)
-    for p in pairs:
-        for idx in (p['i'], p['j']):
-            if order.index(p['status']) < order.index(worst[idx]):
-                worst[idx] = p['status']
-    return worst
-
-
-###############################################################################
-# HEATMAP DATA
-###############################################################################
-
-def build_heatmap_data(rows: list) -> list:
-    """Generates weighted sample points for folium HeatMap."""
-    points = []
-    for r in rows:
-        points.append([r['lat'], r['lon'], 1.5])
-        for ring_miles, weight in [(5, 1.0), (10, 0.4)]:
-            ring_deg = ring_miles / 69.0
-            for angle in range(0, 360, 6):
-                rad = math.radians(angle)
-                lat = r['lat'] + ring_deg * math.cos(rad)
-                lon = (r['lon']
-                       + ring_deg / math.cos(math.radians(r['lat'])) * math.sin(rad))
-                points.append([lat, lon, weight])
-    return points
-
-
-###############################################################################
-# FOLIUM MAP
-###############################################################################
-
-_STATUS_COLOURS = {
-    'too_close':  ('#C62828', '#B71C1C'),   # dark red bg / border
-    'overlap_ok': ('#F57F17', '#E65100'),   # amber bg / border
-    'ideal':      ('#2e7d32', '#1b5e20'),   # green bg / border (original)
-    'too_sparse': ('#1565C0', '#0D47A1'),   # blue bg / border
-}
-
-
-def build_folium_map(df_map_data: pd.DataFrame, show_heatmap: bool = False) -> tuple:
-    """Returns (folium.Map, spread_pairs list)."""
+def build_folium_map(df_map_data: pd.DataFrame) -> folium.Map:
     if df_map_data.empty or 'zip' not in df_map_data.columns:
-        return folium.Map(location=[39.5, -98.35], zoom_start=4, tiles='OpenStreetMap'), []
+        return folium.Map(location=[39.5, -98.35], zoom_start=4, tiles='OpenStreetMap')
 
     df_map_data = df_map_data.copy()
     df_map_data['zip'] = df_map_data['zip'].astype(str).str.zfill(5)
 
-    rows, not_found = [], []
+    # Resolve coordinates for each ZIP
+    rows = []
+    not_found = []
     for _, row in df_map_data.iterrows():
         coords = get_zip_coords(row['zip'])
         if coords:
@@ -193,7 +140,7 @@ def build_folium_map(df_map_data: pd.DataFrame, show_heatmap: bool = False) -> t
         st.warning(f"ZIP codes not found in database: {', '.join(not_found)}")
 
     if not rows:
-        return folium.Map(location=[39.5, -98.35], zoom_start=4, tiles='OpenStreetMap'), []
+        return folium.Map(location=[39.5, -98.35], zoom_start=4, tiles='OpenStreetMap')
 
     lats = [r['lat'] for r in rows]
     lons = [r['lon'] for r in rows]
@@ -201,10 +148,6 @@ def build_folium_map(df_map_data: pd.DataFrame, show_heatmap: bool = False) -> t
     center_lon = (min(lons) + max(lons)) / 2
 
     m = folium.Map(location=[center_lat, center_lon], tiles='OpenStreetMap')
-
-    # Spread analysis
-    pairs = analyse_spread(rows)
-    worst = worst_status_per_zip(rows, pairs)
 
     has_role_data = any(
         (r.get('teachers', 0) or 0) + (r.get('tas', 0) or 0) > 0
@@ -221,27 +164,33 @@ def build_folium_map(df_map_data: pd.DataFrame, show_heatmap: bool = False) -> t
         county = r.get('county', '')
 
         location_label = f"{city}, {state}" if city and state else zip_code
-        bg_colour, border_colour = _STATUS_COLOURS[worst[serial - 1]]
 
-        popup_lines = [f"<b>ZIP: {zip_code}</b>", f"{location_label}"]
+        popup_lines = [
+            f"<b>ZIP: {zip_code}</b>",
+            f"{location_label}",
+        ]
         if county:
             popup_lines.append(f"{county} County")
         if has_role_data:
-            popup_lines += ["─────────",
-                            f"Teachers: {teachers}",
-                            f"TAs: {tas}",
-                            f"Total: {teachers + tas}"]
+            popup_lines.append("─────────")
+            popup_lines.append(f"Teachers: {teachers}")
+            popup_lines.append(f"TAs: {tas}")
+            popup_lines.append(f"Total: {teachers + tas}")
         popup_html = "<br>".join(popup_lines)
 
         icon_html = f"""
             <div style="
-                background-color: {bg_colour};
+                background-color: #2e7d32;
                 color: white;
-                border: 2px solid {border_colour};
+                border: 2px solid #1b5e20;
                 border-radius: 50%;
-                width: 28px; height: 28px;
-                display: flex; align-items: center; justify-content: center;
-                font-size: 12px; font-weight: bold;
+                width: 28px;
+                height: 28px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 12px;
+                font-weight: bold;
                 box-shadow: 1px 1px 3px rgba(0,0,0,0.4);
             ">{serial}</div>
         """
@@ -253,21 +202,27 @@ def build_folium_map(df_map_data: pd.DataFrame, show_heatmap: bool = False) -> t
         ).add_to(m)
 
         folium.Circle(
-            location=[lat, lon], radius=8047,
-            color='#1565C0', fill=False, weight=2.5, opacity=0.85,
+            location=[lat, lon],
+            radius=8047,
+            color='#1565C0',
+            fill=False,
+            weight=2.5,
+            opacity=0.85,
             tooltip=f"5-mile radius — ZIP {zip_code}",
         ).add_to(m)
         folium.Circle(
-            location=[lat, lon], radius=16093,
-            color='#2E7D32', fill=False, weight=2.5, opacity=0.85,
-            dash_array='8', tooltip=f"10-mile radius — ZIP {zip_code}",
+            location=[lat, lon],
+            radius=16093,
+            color='#2E7D32',
+            fill=False,
+            weight=2.5,
+            opacity=0.85,
+            dash_array='8',
+            tooltip=f"10-mile radius — ZIP {zip_code}",
         ).add_to(m)
 
-    if show_heatmap:
-        HeatMap(build_heatmap_data(rows), radius=25, blur=20, min_opacity=0.3).add_to(m)
-
     m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
-    return m, pairs
+    return m
 
 
 ###############################################################################
@@ -285,12 +240,10 @@ zip_text = st.sidebar.text_area(
 if zip_text and zip_text.strip():
     preview_df = parse_zips_from_text(zip_text)
     count = len(preview_df)
-    st.sidebar.caption(
-        f"{count} valid ZIP code{'s' if count != 1 else ''} recognised."
-        if count else "No valid ZIP codes found yet."
-    )
-
-show_heatmap = st.sidebar.checkbox("Show coverage heatmap", value=False)
+    if count:
+        st.sidebar.caption(f"{count} valid ZIP code{'s' if count != 1 else ''} recognised.")
+    else:
+        st.sidebar.caption("No valid ZIP codes found yet.")
 
 generate_map_button = st.sidebar.button("Generate Map", key="generate_map_button_main")
 
@@ -310,33 +263,9 @@ if generate_map_button:
 if 'map_zip_text' in st.session_state:
     df_map_data_for_plot = parse_zips_from_text(st.session_state['map_zip_text'])
     try:
-        folium_map, pairs = build_folium_map(df_map_data_for_plot, show_heatmap=show_heatmap)
+        folium_map = build_folium_map(df_map_data_for_plot)
         st_folium(folium_map, use_container_width=True, height=600)
         st.success("Map generated successfully! Pan and zoom freely.")
-
-        # ── Spread Analysis sidebar panel ──────────────────────────────────────
-        if pairs:
-            _LABELS = {
-                'too_close':  ('🔴', 'Too close',  '< 10 mi — 5-mile rings overlap'),
-                'overlap_ok': ('🟡', 'Some overlap', '10–20 mi — acceptable'),
-                'ideal':      ('🟢', 'Ideal spread', '20–25 mi — rings nearly touching'),
-                'too_sparse': ('🔵', 'Too sparse',  '> 25 mi — coverage gap'),
-            }
-            counts = {k: 0 for k in _LABELS}
-            for p in pairs:
-                counts[p['status']] += 1
-
-            with st.sidebar.expander("📊 Spread Analysis", expanded=True):
-                for key, (icon, label, desc) in _LABELS.items():
-                    if counts[key]:
-                        st.markdown(f"{icon} **{label}** ({counts[key]} pair{'s' if counts[key]>1 else ''}) — *{desc}*")
-
-                st.markdown("---")
-                for p in sorted(pairs, key=lambda x: x['miles']):
-                    icon = _LABELS[p['status']][0]
-                    st.markdown(
-                        f"{icon} ZIP **{p['zip_i']}** ↔ **{p['zip_j']}** — {p['miles']} mi"
-                    )
 
         map_html = folium_map._repr_html_()
         st.download_button(
