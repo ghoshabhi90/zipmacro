@@ -4,6 +4,7 @@ import folium
 import zipcodes as zc
 from streamlit_folium import st_folium
 import re
+import math
 from pathlib import Path
 
 st.set_page_config(layout="wide")
@@ -116,12 +117,90 @@ def parse_zips_from_text(text: str) -> pd.DataFrame:
 
 
 ###############################################################################
+# SPREAD ANALYSIS
+###############################################################################
+
+def haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 3958.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _classify_pair(miles: float) -> str:
+    if miles < 10:
+        return 'too_close'
+    if miles < 20:
+        return 'overlap_ok'
+    if miles <= 25:
+        return 'ideal'
+    return 'too_sparse'
+
+
+def analyse_spread(rows: list) -> list:
+    pairs = []
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            miles = haversine_miles(rows[i]['lat'], rows[i]['lon'], rows[j]['lat'], rows[j]['lon'])
+            pairs.append({
+                'i': i, 'j': j,
+                'zip_i': rows[i]['zip'], 'zip_j': rows[j]['zip'],
+                'miles': round(miles, 1),
+                'status': _classify_pair(miles),
+            })
+    return pairs
+
+
+def compute_spread_score(pairs: list) -> int | None:
+    if not pairs:
+        return None
+    counts = {'too_close': 0, 'overlap_ok': 0, 'ideal': 0, 'too_sparse': 0}
+    for p in pairs:
+        counts[p['status']] += 1
+    total = len(pairs)
+    if counts['too_sparse'] / total > 0.5:
+        return 6
+    quality = (counts['overlap_ok'] * 0.5 + counts['ideal'] * 1.0) / total
+    return max(1, min(5, round(1 + 4 * quality)))
+
+
+_SCORE_LABELS = {
+    1: ("Heavily clustered", "ZIPs are bunched together — redundant coverage"),
+    2: ("Mostly clustered", "Significant ring overlap across most pairs"),
+    3: ("Mixed spread", "Some well-spaced pairs, some clustering"),
+    4: ("Good spread", "Most ZIPs are well-placed"),
+    5: ("Ideal spread", "Coverage rings mesh cleanly — great arrangement"),
+    6: ("Too sparse", "ZIPs are too far apart — coverage gaps likely"),
+}
+
+
+def recommend_zips(rows: list, pairs: list) -> list:
+    """Greedy removal of too_close ZIPs — keep the best-spread subset."""
+    too_close = [(p['i'], p['j']) for p in pairs if p['status'] == 'too_close']
+    if not too_close:
+        return rows
+    removed = set()
+    active = list(too_close)
+    while active:
+        count = {}
+        for i, j in active:
+            count[i] = count.get(i, 0) + 1
+            count[j] = count.get(j, 0) + 1
+        to_remove = max(count, key=lambda x: (count[x], x))
+        removed.add(to_remove)
+        active = [(i, j) for i, j in active if i not in removed and j not in removed]
+    return [r for idx, r in enumerate(rows) if idx not in removed]
+
+
+###############################################################################
 # FOLIUM MAP FUNCTION
 ###############################################################################
 
-def build_folium_map(df_map_data: pd.DataFrame) -> folium.Map:
+def build_folium_map(df_map_data: pd.DataFrame) -> tuple[folium.Map, list, list]:
     if df_map_data.empty or 'zip' not in df_map_data.columns:
-        return folium.Map(location=[39.5, -98.35], zoom_start=4, tiles='OpenStreetMap')
+        return folium.Map(location=[39.5, -98.35], zoom_start=4, tiles='OpenStreetMap'), [], []
 
     df_map_data = df_map_data.copy()
     df_map_data['zip'] = df_map_data['zip'].astype(str).str.zfill(5)
@@ -140,7 +219,7 @@ def build_folium_map(df_map_data: pd.DataFrame) -> folium.Map:
         st.warning(f"ZIP codes not found in database: {', '.join(not_found)}")
 
     if not rows:
-        return folium.Map(location=[39.5, -98.35], zoom_start=4, tiles='OpenStreetMap')
+        return folium.Map(location=[39.5, -98.35], zoom_start=4, tiles='OpenStreetMap'), [], []
 
     lats = [r['lat'] for r in rows]
     lons = [r['lon'] for r in rows]
@@ -221,8 +300,9 @@ def build_folium_map(df_map_data: pd.DataFrame) -> folium.Map:
             tooltip=f"10-mile radius — ZIP {zip_code}",
         ).add_to(m)
 
-    m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]])
-    return m
+    m.fit_bounds([[min(lats), min(lons)], [max(lats), max(lons)]], max_zoom=11)
+    pairs = analyse_spread(rows)
+    return m, pairs, rows
 
 
 ###############################################################################
@@ -263,9 +343,25 @@ if generate_map_button:
 if 'map_zip_text' in st.session_state:
     df_map_data_for_plot = parse_zips_from_text(st.session_state['map_zip_text'])
     try:
-        folium_map = build_folium_map(df_map_data_for_plot)
-        st_folium(folium_map, use_container_width=True, height=600)
+        folium_map, pairs, rows = build_folium_map(df_map_data_for_plot)
+        st_folium(folium_map, use_container_width=True, height=750, key="main_map")
         st.success("Map generated successfully! Pan and zoom freely.")
+
+        score = compute_spread_score(pairs)
+        if score is None:
+            st.sidebar.metric("Spread Score", "N/A")
+            st.sidebar.caption("Need 2+ ZIP codes to calculate spread.")
+        else:
+            label, description = _SCORE_LABELS[score]
+            display = f"{score} / 5" if score <= 5 else "6 — Too sparse"
+            st.sidebar.metric("Spread Score", display)
+            st.sidebar.caption(f"**{label}** — {description}")
+
+        if rows:
+            st.sidebar.markdown("---")
+            for idx, r in enumerate(rows, start=1):
+                city_state = f"{r['city']}, {r['state']}" if r.get('city') else r['zip']
+                st.sidebar.caption(f"**#{idx}** · {r['zip']} — {city_state}")
 
         map_html = folium_map._repr_html_()
         st.download_button(
@@ -274,6 +370,24 @@ if 'map_zip_text' in st.session_state:
             file_name="zip_code_map.html",
             mime="text/html",
         )
+
+        if rows and pairs:
+            rec_rows = recommend_zips(rows, pairs)
+            if len(rec_rows) < len(rows):
+                st.markdown("---")
+                st.subheader(f"Recommended: {len(rec_rows)} of {len(rows)} ZIPs")
+                removed_count = len(rows) - len(rec_rows)
+                st.caption(f"Removed {removed_count} ZIP{'s' if removed_count != 1 else ''} that were too close to others.")
+                rec_df = pd.DataFrame([{
+                    'zip': r['zip'],
+                    'teachers': r.get('teachers', 0),
+                    'tas': r.get('tas', 0),
+                } for r in rec_rows])
+                rec_map, _, _ = build_folium_map(rec_df)
+                st_folium(rec_map, use_container_width=True, height=750, key="rec_map")
+                rec_zip_text = "\n".join(r['zip'] for r in rec_rows)
+                st.code(rec_zip_text, language=None)
+
     except Exception as e:
         st.error(f"Error during map generation: {e}")
         st.exception(e)
