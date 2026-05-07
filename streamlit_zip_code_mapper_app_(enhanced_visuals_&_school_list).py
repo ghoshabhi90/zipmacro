@@ -156,10 +156,28 @@ def analyse_spread(rows: list) -> list:
 def compute_spread_score(pairs: list) -> int | None:
     if not pairs:
         return None
-    counts = {'too_close': 0, 'overlap_ok': 0, 'ideal': 0, 'too_sparse': 0}
+    # Score on nearest-neighbour distance per ZIP, not all pairs.
+    # Two ZIPs on opposite sides of a metro being 40 miles apart shouldn't
+    # penalise a well-spread arrangement.
+    nn = {}
     for p in pairs:
-        counts[p['status']] += 1
-    total = len(pairs)
+        i, j, d = p['i'], p['j'], p['miles']
+        if i not in nn or d < nn[i]:
+            nn[i] = d
+        if j not in nn or d < nn[j]:
+            nn[j] = d
+
+    def _nn_tier(d):
+        if d < 10:  return 'too_close'
+        if d < 15:  return 'overlap_ok'
+        if d <= 35: return 'ideal'
+        return 'too_sparse'
+
+    statuses = [_nn_tier(d) for d in nn.values()]
+    counts = {'too_close': 0, 'overlap_ok': 0, 'ideal': 0, 'too_sparse': 0}
+    for s in statuses:
+        counts[s] += 1
+    total = len(statuses)
     if counts['too_sparse'] / total > 0.5:
         return 6
     quality = (counts['overlap_ok'] * 0.5 + counts['ideal'] * 1.0) / total
@@ -362,14 +380,6 @@ if 'map_zip_text' in st.session_state:
             for idx, r in enumerate(rows, start=1):
                 city_state = f"{r['city']}, {r['state']}" if r.get('city') else r['zip']
                 st.sidebar.caption(f"**#{idx}** · {r['zip']} — {city_state}")
-
-        map_html = folium_map._repr_html_()
-        st.download_button(
-            label="Download Map as HTML",
-            data=map_html,
-            file_name="zip_code_map.html",
-            mime="text/html",
-        )
 
         if rows and pairs:
             rec_rows = recommend_zips(rows, pairs)
